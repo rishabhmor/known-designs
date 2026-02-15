@@ -1,0 +1,17 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.class
+/bin/
+/build/
+/target/
+*.log
+node_modules/
+*.jar

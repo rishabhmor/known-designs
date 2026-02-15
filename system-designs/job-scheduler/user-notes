@@ -1,0 +1,35 @@
+
+
+
+What does the availability mean here in job scheduler system 
+
+1. If there are two different schedules of the same job will it even work ??
+
+2. 
+
+
+
+User, Task, Job, Schedule -> 
+
+
+
+
+
+
+Question -. How do we handle the immediate scheduling in this design ? 
+
+write to jobs table and also push to queue ? 
+Or maybe a separate SQS for this where it immediately gets scheduled. 
+A queue is necessary 
+
+
+
+
+within 2sec
+at least once execution of job
+scale up to 10k jobs 
+
+
+
+
+

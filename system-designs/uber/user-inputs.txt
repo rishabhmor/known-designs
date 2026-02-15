@@ -1,0 +1,31 @@
+
+
+1. How does the temporal system interact with the matching engine is a
+fundamental question. 
+We give each rider a 10second time to accept, We use the redis lock . 
+
+But who takes the redis lock ? 
+
+
+Does match service expose an API find and match ? 
+Which the temporal system then uses to actually match the users. 
+
+
+Do we create a 100driver list and we keep on trying 10 at a time and reuse the input the next time ? 
+Here I mean that the first find and match returns a matched driver and set of other 99 drivers which can be used by the 
+temporal next time to prefeed the find and match API or is it too much optimization ? 
+Basically the heavy task we are trying to optimize here is querying redis and filtering out available drivers 
+, some nearby riders might also be already taking a ride. 
+
+How do we design a simple system here -> 
+
+I guess temporal keeps a track of all the drivers already tried as a basic and the match service skips those drivers atleast
+or match service just gives the top 100 each time and temporal can skip ? 
+But i guess better would be to feed the information to match service and let it take the call for the better context 
+
+
+
+Send PN should be a task in temporal I guess which will invoke the notification service which in turn would 
+invoke the FCM/APNS API 
+
+

@@ -473,24 +473,67 @@ At least one of them detects the match. ✅
 
 ### Hybrid Architecture
 
-Use both Redis and Cassandra for best of both worlds:
+Use Redis, Kafka, and Cassandra for durability and decoupling:
 
 ```
-┌─────────────┐       ┌─────────────┐       ┌─────────────┐
-│   Client    │──────▶│    Redis    │──────▶│  Cassandra  │
-│             │       │  (atomic    │  async│  (durable   │
-│             │       │   matching) │       │   storage)  │
-└─────────────┘       └─────────────┘       └─────────────┘
-                            │
-                            ▼
-                      Match detected?
-                      → Create match record
+┌─────────────┐       ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│   Client    │──────▶│    Redis    │──────▶│    Kafka    │──────▶│  Cassandra  │
+│             │       │  (atomic    │       │  (durable   │       │  (permanent │
+│             │       │   matching) │       │   buffer)   │       │   storage)  │
+└─────────────┘       └─────────────┘       └─────────────┘       └─────────────┘
+                            │                     │
+                            ▼                     ▼
+                      Match detected?        Other consumers
+                      → Create match record  (analytics, ML, etc.)
                       → Send push notification
 ```
 
-- **Redis**: Handles atomic matching logic (in-memory, fast)
-- **Cassandra**: Durable storage of all swipes (async write)
-- **If Redis loses data**: Only lose match detection for last ~1 second; user can swipe again
+**Component Responsibilities:**
+- **Redis**: Atomic matching logic via Lua scripts, durable with AOF (`appendfsync everysec`)
+- **Kafka**: Decouples Redis from Cassandra, buffers during spikes, enables replay
+- **Cassandra**: Permanent storage of all swipes for history/analytics
+
+**Kafka Topics:**
+- `swipes` — all swipe events (user_id, target_id, direction, timestamp)
+- `matches` — match events for downstream processing (notifications, analytics)
+
+---
+
+### Handling Redis → Kafka Failures
+
+What if Redis write succeeds but Kafka publish fails?
+
+**Approach: Accept the trade-off with safety nets**
+
+```
+┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+│   Client    │──────▶│    Redis    │──────▶│    Kafka    │
+│             │       │  (AOF/fsync)│       │             │
+└─────────────┘       └─────────────┘       └─────────────┘
+                            │                     ▲
+                            │                     │
+                            └── async retry ──────┘
+                                on failure
+```
+
+**Safety mechanisms:**
+
+| Layer | Protection |
+|-------|------------|
+| **Redis AOF** | `appendfsync everysec` — lose max 1 second of data on crash |
+| **Async client retries** | App server retries failed Kafka publishes in background |
+| **Alerting** | Monitor Kafka publish failures; alert on sustained issues |
+| **Recovery path** | Can sync Kafka/Cassandra from Redis AOF if needed |
+
+**Why this works for Tinder:**
+- Swipes are **idempotent** — if lost, user just swipes again
+- Match detection (critical path) works via Redis regardless of Kafka
+- Losing 0.001% of swipes during a Kafka outage is acceptable
+- Redis AOF ensures we have a durable source of truth for recovery
+
+**Redis fsync options:**
+- `appendfsync always` — every write fsynced (safest, slower)
+- `appendfsync everysec` — fsync every second (recommended: good balance)
 
 ---
 

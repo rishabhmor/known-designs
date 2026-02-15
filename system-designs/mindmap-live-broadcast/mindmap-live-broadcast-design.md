@@ -1803,12 +1803,185 @@ GET    /api/v1/me/workflows                       # List my workflows
 # Live session management
 POST   /api/v1/workflows/{id}/live/start          # Start live session
 POST   /api/v1/workflows/{id}/live/stop           # Stop live session
-GET    /api/v1/workflows/{id}/viewers             # Get viewer count
+GET    /api/v1/workflows/{id}/live                # Get live session status
+GET    /api/v1/workflows/{id}/live/viewers        # Get viewer count
 
 # Discovery
 GET    /api/v1/live                               # List all live workflows
 GET    /api/v1/creators/{id}/live                 # Get creator's live workflow
 ```
+
+### API Design Rationale: Why `/live/start` not `/start`?
+
+The `/live` sub-resource pattern provides semantic clarity:
+
+```
+/workflows/{id}/start      ← Ambiguous: Start what? Editing? Execution? Broadcast?
+/workflows/{id}/live/start ← Clear: Start the live broadcast session
+```
+
+**Resource Hierarchy:**
+- `/workflows/{id}` — The workflow (persistent resource)
+- `/workflows/{id}/live` — The live session (ephemeral sub-resource)
+- `/workflows/{id}/live/start` — Action on the live session
+
+This mirrors patterns like YouTube Live:
+- `/videos/{id}` — The video
+- `/videos/{id}/live/start` — Start live streaming
+- `/videos/{id}/live/chat` — Live chat messages
+
+Benefits:
+1. **Extensibility**: Easy to add `/live/pause`, `/live/analytics`, `/live/chat`
+2. **REST compliance**: "live" is a noun (resource), "start" is an action
+3. **Self-documenting**: URL structure reveals the domain model
+
+---
+
+## WebSocket Connection Establishment
+
+### Connection Flow
+
+Two approaches exist for establishing WebSocket after the `/live/start` API:
+
+**Approach 1: Separate Connection (Recommended for Scale)**
+```
+Creator                          Server
+   │ POST /live/start              │
+   │──────────────────────────────▶│
+   │◀─────────────────────────────│
+   │ { ws_url, connection_token }  │
+   │                               │
+   │ (HTTP connection closes)      │
+   │                               │
+   │ NEW: ws = WebSocket(ws_url)   │
+   │──────────────────────────────▶│
+   │◀══════════════════════════════│ WebSocket established
+```
+
+**Approach 2: Direct Upgrade (Simpler, Single Server)**
+```
+Creator                          Server
+   │ POST /live/start              │
+   │ Upgrade: websocket            │
+   │──────────────────────────────▶│
+   │◀─────────────────────────────│
+   │ 101 Switching Protocols       │
+   │◀══════════════════════════════│ Same TCP connection upgraded
+```
+
+**Trade-offs:**
+
+| Aspect | Separate Connection | Direct Upgrade |
+|--------|---------------------|----------------|
+| TCP connections | 2 | 1 |
+| Latency | Higher (+1 handshake) | Lower |
+| Load balancing | Flexible (route WS to different server) | Sticky to same server |
+| Scaling | API and Gateway scale independently | Coupled scaling |
+| Complexity | Higher (token management) | Lower |
+
+**Our choice: Separate Connection** because:
+- Gateway fleet (200 servers) scales independently from API servers
+- Geographic distribution (gateways near users)
+- Failure isolation (gateway crash doesn't affect API)
+
+### Why Creator Needs WebSocket (Not Just Viewers)
+
+Creator requires bidirectional communication:
+- **Upstream**: Send actions, undo/redo commands
+- **Downstream**: Receive ACKs, viewer count updates, error notifications
+
+HTTP request-per-action would add ~50-100ms latency per action vs ~10ms on persistent WebSocket.
+
+### Why Not Server-Initiated Connections?
+
+Server-initiated WebSocket (server connects to client) only works for server-to-server scenarios (IoT, microservices). Browser clients:
+- Cannot accept incoming connections (security model)
+- Are behind NAT/firewalls
+- Have no public endpoint
+
+All browser-server communication must be client-initiated.
+
+---
+
+## Sequence Number Assignment
+
+### The Problem
+
+Multiple servers receiving actions concurrently need to assign unique, monotonically increasing sequence numbers that preserve ordering.
+
+### Approaches
+
+**1. Centralized Counter (Redis INCR)**
+```go
+seq := redis.Incr("workflow:seq:" + workflowId)  // Atomic, ~0.5-1ms
+```
+- ✅ Unique, monotonic, strictly ordered
+- ✅ Simple implementation
+- ❌ Single point of contention
+- **Use when**: Per-resource sequences, moderate scale (<100k ops/sec)
+
+**2. Server Timestamp (Nanosecond)**
+```go
+seq := time.Now().UnixNano()  // Local, ~0.1ms
+```
+- ✅ No coordination needed, very fast
+- ✅ Works if same server handles all actions for a workflow
+- ❌ Cross-server clock skew can break ordering
+- **Use when**: Sticky sessions guarantee same server per workflow
+
+**3. Kafka Offset**
+```go
+offset, _ := kafka.Produce(action)  // Kafka assigns offset, ~5-15ms
+seq := offset
+```
+- ✅ Durable, enables replay
+- ✅ Unique within partition
+- ❌ Higher latency
+- **Use when**: Already using Kafka as commit log
+
+### Our Choice: Server Timestamp (Simplified)
+
+For this system, **server timestamp with nanosecond precision** is sufficient:
+
+1. **Single creator per workflow** → WebSocket is sticky → same server handles all actions
+2. **Human editing speed** → ~100-500ms between actions
+3. **Server clock skew** → typically 1-10ms (NTP synced)
+
+**Skew (1-10ms) << Action gap (100-500ms)** → Ordering is safe.
+
+Even on WebSocket reconnect to different server, the reconnection time far exceeds any clock skew.
+
+### Async ACK with Batch API
+
+Client doesn't block on ACKs — keeps drawing while ACKs arrive asynchronously:
+
+```
+Client                              Server
+   │ Batch { local_seq: [1,2,3] }     │
+   │─────────────────────────────────▶│
+   │ (continue drawing...)            │ Assign server_timestamp
+   │                                  │
+   │ Batch { local_seq: [4,5] }       │
+   │─────────────────────────────────▶│
+   │                                  │
+   │◀─────────────────────────────────│
+   │ ACK { batch_id, server_seq }     │
+   │                                  │
+   │ (if no ACK in 5s → pause, retry) │
+```
+
+Server preserves `local_seq` order within each batch, assigns `server_timestamp` to the batch.
+
+### Why Not Client Timestamps?
+
+Client timestamps are unreliable for ordering:
+- **Clock skew**: Different devices have different times (can be minutes/hours off)
+- **Manipulation**: Malicious client can fake timestamps
+- **Network delay**: Doesn't reflect when server received the action
+
+**Client timestamps are fine for**: Display ("created 5 min ago"), analytics, detecting network delay.
+
+**Never use for**: Ordering, conflict resolution, undo/redo sequencing.
 
 ---
 
@@ -1925,6 +2098,12 @@ Alerts:
 
 > **On Scaling:**
 > "For 100M connections, we need ~2000 gateway instances. Each gateway subscribes to Redis Pub/Sub for its connected viewers' workflows. No sticky sessions — any gateway can serve any viewer."
+
+> **On Sequence Assignment:**
+> "Server timestamp with nanosecond precision is sufficient here. Single creator means sticky WebSocket to same server. Human editing speed (~100-500ms between actions) far exceeds any server clock skew (~1-10ms). No need for Redis INCR overhead. Client sends batches with local ordering, server assigns timestamp, ACKs are async."
+
+> **On WebSocket Connection:**
+> "Two-phase: REST API for session setup, then separate WebSocket for streaming. This lets us scale API servers and gateway fleet independently. Direct upgrade (HTTP→WS in same request) is simpler but couples the tiers."
 
 ---
 
